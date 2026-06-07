@@ -14,7 +14,6 @@ processes = {}  # job_id -> subprocess.Popen
 processes_lock = threading.Lock()
 
 RCLONE_CONFIG_PATH = "/root/.config/rclone/rclone.conf"
-# اسم remote از محیط变量 یا پیش‌فرض Google Drive
 DEFAULT_REMOTE = os.environ.get("RCLONE_REMOTE", "Google Drive")
 
 
@@ -59,16 +58,16 @@ def get_referer(url):
 
 
 def build_cmd(url, filename):
-    """ساخت command با remote هوشمند"""
+    """ساخت command با استریم مستقیم و مصرف حافظه کم"""
     safe_url = shlex.quote(url)
-    # استفاده از remote تعریف شده در environment variable
     remote_name = os.environ.get("RCLONE_REMOTE", DEFAULT_REMOTE)
     safe_dest = shlex.quote(f"{remote_name}:/Video/{filename}")
     referer = get_referer(url)
 
+    # روش بهینه: بافر کم + استریم مستقیم
     return (
         f"curl -L "
-        f"--retry 9999 --retry-delay 5 --retry-all-errors "
+        f"--retry 5 --retry-delay 5 --retry-all-errors "
         f"--speed-limit 1 --speed-time 30 "
         f"--keepalive-time 30 "
         f"--max-time 0 "
@@ -78,7 +77,14 @@ def build_cmd(url, filename):
         f"-H 'Accept-Language: en-US,en;q=0.9' "
         f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"{safe_url} | rclone rcat {safe_dest}"
+        f"--buffer-size 32M "  # بافر 32 مگ (کمتر از 500 مگ)
+        f"{safe_url} | "
+        f"rclone rcat "
+        f"--buffer-size 32M "  # بافر rclone هم 32 مگ
+        f"--multi-thread-streams 4 "
+        f"--low-level-retries 5 "
+        f"--no-check-dest "
+        f"{safe_dest}"
     )
 
 
@@ -98,7 +104,6 @@ def run_job(job):
     retry_count = 0
 
     while True:
-        # Check if cancelled before each attempt
         with jobs_lock:
             current_status = jobs.get(job_id, {}).get("status")
         if current_status == "cancelled":
@@ -106,6 +111,7 @@ def run_job(job):
             return
 
         try:
+            # استفاده از bufsize=1 برای خط خط خوندن
             p = subprocess.Popen(
                 cmd,
                 shell=True,
@@ -113,13 +119,14 @@ def run_job(job):
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=env,
+                bufsize=1,  # line buffered
             )
 
             with processes_lock:
                 processes[job_id] = p
 
+            last_progress = 0
             for line in p.stdout:
-                # Check cancel mid-stream
                 with jobs_lock:
                     if jobs.get(job_id, {}).get("status") == "cancelled":
                         p.kill()
@@ -128,7 +135,9 @@ def run_job(job):
 
                 progress = parse_progress(line)
                 if progress is not None:
-                    set_job(job_id, progress=progress)
+                    if progress > last_progress + 1:  # آپدیت هر 1%
+                        last_progress = progress
+                        set_job(job_id, progress=progress)
 
                 if not is_progress_line(line):
                     clean = line.strip()
