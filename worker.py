@@ -73,7 +73,7 @@ def build_cmd(url, filename):
         f"-H 'Accept-Language: en-US,en;q=0.9' "
         f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"{safe_url} | rclone rcat {safe_dest}"
+        f"{safe_url} | rclone rcat --ignore-checksum {safe_dest}"
     )
 
 
