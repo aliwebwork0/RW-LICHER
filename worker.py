@@ -14,6 +14,8 @@ processes = {}  # job_id -> subprocess.Popen
 processes_lock = threading.Lock()
 
 RCLONE_CONFIG_PATH = "/root/.config/rclone/rclone.conf"
+# اسم remote از محیط变量 یا پیش‌فرض Google Drive
+DEFAULT_REMOTE = os.environ.get("RCLONE_REMOTE", "Google Drive")
 
 
 def now():
@@ -57,9 +59,12 @@ def get_referer(url):
 
 
 def build_cmd(url, filename):
-    safe_url  = shlex.quote(url)
-    safe_dest = shlex.quote(f"mega:/Video/{filename}")
-    referer   = get_referer(url)
+    """ساخت command با remote هوشمند"""
+    safe_url = shlex.quote(url)
+    # استفاده از remote تعریف شده در environment variable
+    remote_name = os.environ.get("RCLONE_REMOTE", DEFAULT_REMOTE)
+    safe_dest = shlex.quote(f"{remote_name}:/Video/{filename}")
+    referer = get_referer(url)
 
     return (
         f"curl -L "
@@ -73,17 +78,18 @@ def build_cmd(url, filename):
         f"-H 'Accept-Language: en-US,en;q=0.9' "
         f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"{safe_url} | rclone rcat --ignore-checksum {safe_dest}"
+        f"{safe_url} | rclone rcat {safe_dest}"
     )
 
 
 def run_job(job):
-    job_id   = job["id"]
-    url      = job["url"]
+    job_id = job["id"]
+    url = job["url"]
     filename = job["filename"]
 
     set_job(job_id, status="running", log="", progress=0, retries=0, started_at=now())
     append_log(job_id, f"[{now()}] Starting transfer: {filename}\n")
+    append_log(job_id, f"[{now()}] Using remote: {os.environ.get('RCLONE_REMOTE', DEFAULT_REMOTE)}\n")
 
     cmd = build_cmd(url, filename)
     env = os.environ.copy()
