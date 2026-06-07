@@ -33,11 +33,17 @@ def append_log(job_id, text):
 
 
 def parse_progress(line):
-    """Extract % progress from curl --progress-bar output."""
-    match = re.search(r'(\d+\.\d+)%', line)
+    """Extract % from curl --progress-bar output like: 45.2%"""
+    match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
     if match:
         return float(match.group(1))
     return None
+
+
+def is_progress_line(line):
+    """True if line is curl progress bar noise (only #, space, %, digits)."""
+    stripped = line.strip()
+    return bool(re.match(r'^[#=\-\s\d.%|]*$', stripped))
 
 
 def get_referer(url):
@@ -48,28 +54,6 @@ def get_referer(url):
         return f"{p.scheme}://{p.netloc}/"
     except Exception:
         return url
-
-
-def build_cmd(url, filename):
-    safe_url  = shlex.quote(url)
-    safe_dest = shlex.quote(f"mega:/Video/{filename}")
-    referer   = shlex.quote(get_referer(url))
-
-    return (
-        f"curl -L "
-        f"--retry 9999 --retry-delay 5 --retry-all-errors "
-        f"--speed-limit 1 --speed-time 30 "
-        f"--keepalive-time 30 "
-        f"--max-time 0 "
-        f"-H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36' "
-        f"-H {referer.replace(referer, f'Referer: {get_referer(url)}')} "
-        f"-H 'Accept: */*' "
-        f"-H 'Accept-Language: en-US,en;q=0.9' "
-        f"-H 'Connection: keep-alive' "
-        f"--progress-bar "
-        f"{safe_url} | rclone rcat --no-checksum {safe_dest}"
-    )
 
 
 def build_cmd(url, filename):
@@ -89,7 +73,7 @@ def build_cmd(url, filename):
         f"-H 'Accept-Language: en-US,en;q=0.9' "
         f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"{safe_url} | rclone rcat --no-checksum {safe_dest}"
+        f"{safe_url} | rclone rcat {safe_dest}"
     )
 
 
@@ -139,9 +123,10 @@ def run_job(job):
                 progress = parse_progress(line)
                 if progress is not None:
                     set_job(job_id, progress=progress)
-                else:
+
+                if not is_progress_line(line):
                     clean = line.strip()
-                    if clean and not set(clean) <= {'#', ' ', '\r'}:
+                    if clean:
                         append_log(job_id, f"[{now()}] {clean}\n")
 
             p.wait()
