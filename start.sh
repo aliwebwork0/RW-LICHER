@@ -1,7 +1,9 @@
 #!/bin/sh
 set -e
 
-# Setup rclone config from environment variable
+# نصب aria2 برای دانلود چندگیگی
+apt-get update && apt-get install -y aria2
+
 mkdir -p /root/.config/rclone
 
 if [ -z "$RCLONE_CONF" ]; then
@@ -15,8 +17,10 @@ chmod 600 /root/.config/rclone/rclone.conf
 export RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 
 echo "==> rclone config written successfully"
-echo "==> Starting worker..."
+echo "==> aria2 version:"
+aria2c --version
 
+echo "==> Starting worker..."
 python3 worker.py &
 
 echo "==> Starting gunicorn..."
