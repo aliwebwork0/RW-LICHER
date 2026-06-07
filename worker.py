@@ -4,13 +4,14 @@ import threading
 import subprocess
 import shlex
 import time
+import signal
 from queue import Queue
 from datetime import datetime
 
 job_queue = Queue()
 jobs = {}
 jobs_lock = threading.Lock()
-processes = {}  # job_id -> subprocess.Popen
+processes = {}
 processes_lock = threading.Lock()
 
 RCLONE_CONFIG_PATH = "/root/.config/rclone/rclone.conf"
@@ -34,21 +35,13 @@ def append_log(job_id, text):
 
 
 def parse_progress(line):
-    """Extract % from curl --progress-bar output like: 45.2%"""
     match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
     if match:
         return float(match.group(1))
     return None
 
 
-def is_progress_line(line):
-    """True if line is curl progress bar noise (only #, space, %, digits)."""
-    stripped = line.strip()
-    return bool(re.match(r'^[#=\-\s\d.%|]*$', stripped))
-
-
 def get_referer(url):
-    """Extract base domain as referer."""
     try:
         from urllib.parse import urlparse
         p = urlparse(url)
@@ -58,32 +51,62 @@ def get_referer(url):
 
 
 def build_cmd(url, filename):
-    """ساخت command با استریم مستقیم و مصرف حافظه کم"""
+    """روش مخصوص فایل چند گیگی - دانلود با aria2 + آپلود تکه تکه"""
     safe_url = shlex.quote(url)
     remote_name = os.environ.get("RCLONE_REMOTE", DEFAULT_REMOTE)
     safe_dest = shlex.quote(f"{remote_name}:/Video/{filename}")
     referer = get_referer(url)
+    
+    # استفاده از aria2 برای دانلود چندبخشی و استریم همزمان
+    return (
+        f"aria2c --quiet=true "
+        f"--max-connection-per-server=16 "
+        f"--split=16 "
+        f"--min-split-size=10M "
+        f"--max-concurrent-downloads=1 "
+        f"--continue=true "
+        f"--max-tries=0 "
+        f"--retry-wait=5 "
+        f"--timeout=60 "
+        f"--referer={referer} "
+        f"--user-agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' "
+        f"--summary-interval=0 "
+        f"--console-log-level=warn "
+        f"-o - {safe_url} | "
+        f"rclone rcat "
+        f"--buffer-size=64M "
+        f"--multi-thread-streams=8 "
+        f"--low-level-retries=10 "
+        f"--timeout=30m "
+        f"--no-check-dest "
+        f"{safe_dest}"
+    )
 
-    # روش بهینه: بافر کم + استریم مستقیم
+
+def build_cmd_fallback(url, filename):
+    """روش دوم: curl با resume و تکه تکه"""
+    safe_url = shlex.quote(url)
+    remote_name = os.environ.get("RCLONE_REMOTE", DEFAULT_REMOTE)
+    safe_dest = shlex.quote(f"{remote_name}:/Video/{filename}")
+    referer = get_referer(url)
+    
     return (
         f"curl -L "
-        f"--retry 5 --retry-delay 5 --retry-all-errors "
-        f"--speed-limit 1 --speed-time 30 "
-        f"--keepalive-time 30 "
+        f"--retry 9999 --retry-delay 5 --retry-all-errors "
+        f"--speed-limit 1 --speed-time 60 "
+        f"--keepalive-time 60 "
         f"--max-time 0 "
-        f"-H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36' "
+        f"--continue-at - "  # resume support
+        f"--limit-rate 20M "  # محدودیت سرعت برای پایداری
+        f"-H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' "
         f"-H 'Referer: {referer}' "
-        f"-H 'Accept: */*' "
-        f"-H 'Accept-Language: en-US,en;q=0.9' "
-        f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"--buffer-size 32M "  # بافر 32 مگ (کمتر از 500 مگ)
         f"{safe_url} | "
         f"rclone rcat "
-        f"--buffer-size 32M "  # بافر rclone هم 32 مگ
-        f"--multi-thread-streams 4 "
-        f"--low-level-retries 5 "
-        f"--no-check-dest "
+        f"--buffer-size=16M "
+        f"--multi-thread-streams=4 "
+        f"--low-level-retries=10 "
+        f"--timeout=60m "
         f"{safe_dest}"
     )
 
@@ -96,8 +119,17 @@ def run_job(job):
     set_job(job_id, status="running", log="", progress=0, retries=0, started_at=now())
     append_log(job_id, f"[{now()}] Starting transfer: {filename}\n")
     append_log(job_id, f"[{now()}] Using remote: {os.environ.get('RCLONE_REMOTE', DEFAULT_REMOTE)}\n")
+    append_log(job_id, f"[{now()}] ⚡ Large file mode enabled\n")
 
-    cmd = build_cmd(url, filename)
+    # چک کردن وجود aria2
+    try:
+        subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
+        cmd = build_cmd(url, filename)
+        append_log(job_id, f"[{now()}] Using aria2 (multi-thread download)\n")
+    except:
+        cmd = build_cmd_fallback(url, filename)
+        append_log(job_id, f"[{now()}] Using curl fallback\n")
+    
     env = os.environ.copy()
     env["RCLONE_CONFIG"] = RCLONE_CONFIG_PATH
 
@@ -111,7 +143,6 @@ def run_job(job):
             return
 
         try:
-            # استفاده از bufsize=1 برای خط خط خوندن
             p = subprocess.Popen(
                 cmd,
                 shell=True,
@@ -119,13 +150,12 @@ def run_job(job):
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=env,
-                bufsize=1,  # line buffered
+                bufsize=1,
             )
 
             with processes_lock:
                 processes[job_id] = p
 
-            last_progress = 0
             for line in p.stdout:
                 with jobs_lock:
                     if jobs.get(job_id, {}).get("status") == "cancelled":
@@ -135,13 +165,12 @@ def run_job(job):
 
                 progress = parse_progress(line)
                 if progress is not None:
-                    if progress > last_progress + 1:  # آپدیت هر 1%
-                        last_progress = progress
-                        set_job(job_id, progress=progress)
-
-                if not is_progress_line(line):
+                    set_job(job_id, progress=progress)
+                    
+                # فیلتر خطوط اضافی
+                if "%" not in line or "[" not in line:
                     clean = line.strip()
-                    if clean:
+                    if clean and len(clean) < 200:
                         append_log(job_id, f"[{now()}] {clean}\n")
 
             p.wait()
@@ -151,19 +180,25 @@ def run_job(job):
 
             if p.returncode == 0:
                 set_job(job_id, status="done", progress=100, finished_at=now())
-                append_log(job_id, f"[{now()}] ✓ Transfer complete.\n")
+                append_log(job_id, f"[{now()}] ✓ Transfer complete for {filename}\n")
                 return
             else:
                 retry_count += 1
                 set_job(job_id, retries=retry_count)
                 append_log(job_id, f"[{now()}] ✗ Failed (exit {p.returncode}), retrying... (#{retry_count})\n")
-                time.sleep(5)
+                
+                if retry_count > 10:
+                    append_log(job_id, f"[{now()}] ❌ Too many retries, aborting\n")
+                    set_job(job_id, status="failed")
+                    return
+                    
+                time.sleep(10)
 
         except Exception as e:
             retry_count += 1
             set_job(job_id, retries=retry_count)
             append_log(job_id, f"[{now()}] Exception: {e}, retrying... (#{retry_count})\n")
-            time.sleep(5)
+            time.sleep(10)
 
 
 def worker_loop():
