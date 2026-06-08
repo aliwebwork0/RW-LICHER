@@ -434,8 +434,9 @@ function jobItemHTML(id, job) {
   const pct   = job.progress > 0 ? `${job.progress.toFixed(0)}%` : '';
   const open  = openDetails[id] ? 'open' : '';
 
+  const maxR = 5;
   const retryHTML = (job.retries > 0)
-    ? `<span style="font-size:10px;color:var(--warn);margin-left:8px">↻ ${job.retries}</span>`
+    ? `<span style="font-size:10px;color:var(--warn);margin-left:8px" title="Retry attempts">↻ ${job.retries}/${maxR}</span>`
     : '';
 
   return `
@@ -454,10 +455,10 @@ function jobItemHTML(id, job) {
     <div class="job-detail ${open}">
       <div class="job-actions">
         ${job.status === 'running' || job.status === 'queued'
-          ? `<button class="btn-sm danger" onclick="cancelJob('${id}')">⏹ Stop</button>`
+          ? `<button class="btn-sm danger stop-btn" onclick="cancelJob('${id}');event.stopPropagation()">⏹ Stop</button>`
           : ''}
-        <button class="btn-sm danger" onclick="deleteJob('${id}')">🗑 Delete</button>
-        <button class="btn-sm" onclick="copyLog('${id}')">⎘ Copy log</button>
+        <button class="btn-sm danger" onclick="event.stopPropagation();deleteJob('${id}')">🗑 Delete</button>
+        <button class="btn-sm" onclick="event.stopPropagation();copyLog('${id}')">⎘ Copy log</button>
         ${job.started_at ? `<span style="font-size:10px;color:var(--muted);margin-left:auto">Started ${job.started_at}${job.finished_at ? ' · Done '+job.finished_at : ''}</span>` : ''}
       </div>
       <div class="log-wrap">
@@ -516,18 +517,20 @@ function updateJobItem(item, id, job) {
     logEl.scrollTop = logEl.scrollHeight;
   }
 
-  // actions: re-render stop button
+  // actions: sync stop button visibility
   const actions = item.querySelector('.job-actions');
   if (actions) {
     const stopBtn = actions.querySelector('.stop-btn');
-    if ((job.status === 'running' || job.status === 'queued') && !stopBtn) {
-      const btn = document.createElement('button');
-      btn.className = 'btn-sm danger stop-btn';
-      btn.textContent = '⏹ Stop';
-      btn.onclick = () => cancelJob(id);
-      actions.insertBefore(btn, actions.firstChild);
-    } else if (job.status !== 'running' && job.status !== 'queued' && stopBtn) {
-      stopBtn.remove();
+    if (job.status === 'running' || job.status === 'queued') {
+      if (!stopBtn) {
+        const btn = document.createElement('button');
+        btn.className = 'btn-sm danger stop-btn';
+        btn.textContent = '⏹ Stop';
+        btn.onclick = (e) => { e.stopPropagation(); cancelJob(id); };
+        actions.insertBefore(btn, actions.firstChild);
+      }
+    } else {
+      if (stopBtn) stopBtn.remove();
     }
   }
 }
