@@ -178,7 +178,14 @@ def build_cmd(url, filename):
         f"-H 'Accept-Language: en-US,en;q=0.9' "
         f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"{safe_url} | rclone rcat --ignore-checksum --buffer-size 1M {safe_dest}"
+        f"{safe_url} | rclone rcat "
+        f"--ignore-checksum "
+        f"--buffer-size 8M "
+        f"--mega-chunk-size 32M "
+        f"--mega-upload-concurrency 2 "
+        f"--low-level-retries 20 "
+        f"--timeout 30m "
+        f"{safe_dest}"
     )
 
 
@@ -219,6 +226,14 @@ def run_job(job):
                 return
 
         try:
+            # Log RAM usage before each attempt
+            try:
+                import resource
+                mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                log(job_id, f"💾 RAM usage before attempt: {mem_mb:.0f} MB")
+            except Exception:
+                pass
+
             log(job_id, f"🚀 Attempt #{retry_count + 1} — starting curl | rclone pipe")
             p = subprocess.Popen(
                 cmd,
