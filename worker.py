@@ -167,6 +167,7 @@ def build_cmd(url, filename):
 
     return (
         f"curl -L "
+        f"--limit-rate 3M "
         f"--retry 9999 --retry-delay 5 --retry-all-errors "
         f"--speed-limit 1 --speed-time 30 "
         f"--keepalive-time 30 "
@@ -177,7 +178,7 @@ def build_cmd(url, filename):
         f"-H 'Accept-Language: en-US,en;q=0.9' "
         f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"{safe_url} | rclone rcat --ignore-checksum --buffer-size 32M {safe_dest}"
+        f"{safe_url} | rclone rcat --ignore-checksum --buffer-size 1M {safe_dest}"
     )
 
 
@@ -226,6 +227,7 @@ def run_job(job):
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=env,
+                bufsize=1,
             )
 
             with processes_lock:
