@@ -10,10 +10,11 @@ from datetime import datetime
 job_queue = Queue()
 jobs = {}
 jobs_lock = threading.Lock()
-processes = {}  # job_id -> subprocess.Popen
+processes = {}
 processes_lock = threading.Lock()
 
 RCLONE_CONFIG_PATH = "/root/.config/rclone/rclone.conf"
+MIN_VALID_SIZE = 1 * 1024 * 1024  # فایل زیر ۱MB جعلیه
 
 
 def now():
@@ -32,8 +33,13 @@ def append_log(job_id, text):
             jobs[job_id]["log"] += text
 
 
+def log(job_id, msg):
+    line = f"[{now()}] {msg}\n"
+    append_log(job_id, line)
+    print(f"[JOB {job_id[:8]}] {msg}", flush=True)  # Railway log
+
+
 def parse_progress(line):
-    """Extract % from curl --progress-bar output like: 45.2%"""
     match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
     if match:
         return float(match.group(1))
@@ -41,13 +47,11 @@ def parse_progress(line):
 
 
 def is_progress_line(line):
-    """True if line is curl progress bar noise (only #, space, %, digits)."""
     stripped = line.strip()
     return bool(re.match(r'^[#=\-\s\d.%|]*$', stripped))
 
 
 def get_referer(url):
-    """Extract base domain as referer."""
     try:
         from urllib.parse import urlparse
         p = urlparse(url)
@@ -56,9 +60,109 @@ def get_referer(url):
         return url
 
 
+def human_size(b):
+    if b is None:
+        return "unknown"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
+
+
+def get_remote_type():
+    """Detect remote name from rclone config."""
+    try:
+        result = subprocess.run(
+            ["rclone", "listremotes"],
+            capture_output=True, text=True,
+            env={**os.environ, "RCLONE_CONFIG": RCLONE_CONFIG_PATH},
+            timeout=10
+        )
+        remotes = result.stdout.strip().splitlines()
+        if remotes:
+            return remotes[0].rstrip(":")
+    except Exception:
+        pass
+    return "mega"
+
+
+REMOTE = None  # lazy init
+
+
+def get_dest(filename):
+    global REMOTE
+    if REMOTE is None:
+        REMOTE = get_remote_type()
+    return f"{REMOTE}:/Video/{filename}"
+
+
+def get_source_size(url, referer, job_id):
+    """HEAD request to get Content-Length of source file."""
+    log(job_id, f"🔍 Checking source file size...")
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-sLI", "--max-time", "20",
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "-H", f"Referer: {referer}",
+                "-H", "Accept: */*",
+                url
+            ],
+            capture_output=True, text=True,
+            timeout=25
+        )
+        for line in result.stdout.splitlines():
+            if line.lower().startswith("content-length:"):
+                size = int(line.split(":", 1)[1].strip())
+                log(job_id, f"📦 Source size: {human_size(size)} ({size} bytes)")
+                return size
+        log(job_id, "⚠️  Could not get source size (server didn't return Content-Length)")
+    except Exception as e:
+        log(job_id, f"⚠️  HEAD request failed: {e}")
+    return None
+
+
+def get_uploaded_size(dest, job_id):
+    """Check size of uploaded file on cloud."""
+    try:
+        result = subprocess.run(
+            ["rclone", "size", dest, "--json"],
+            capture_output=True, text=True,
+            env={**os.environ, "RCLONE_CONFIG": RCLONE_CONFIG_PATH},
+            timeout=30
+        )
+        import json
+        data = json.loads(result.stdout)
+        size = data.get("bytes", 0)
+        log(job_id, f"☁️  Uploaded size: {human_size(size)} ({size} bytes)")
+        return size
+    except Exception as e:
+        log(job_id, f"⚠️  Could not check uploaded size: {e}")
+    return None
+
+
+def delete_remote_file(dest, job_id):
+    """Delete incomplete/fake file from cloud."""
+    log(job_id, f"🗑  Deleting incomplete file: {dest}")
+    try:
+        result = subprocess.run(
+            ["rclone", "deletefile", dest],
+            capture_output=True, text=True,
+            env={**os.environ, "RCLONE_CONFIG": RCLONE_CONFIG_PATH},
+            timeout=30
+        )
+        if result.returncode == 0:
+            log(job_id, "✓ Incomplete file deleted successfully")
+        else:
+            log(job_id, f"⚠️  Delete failed: {result.stderr.strip()}")
+    except Exception as e:
+        log(job_id, f"⚠️  Delete exception: {e}")
+
+
 def build_cmd(url, filename):
     safe_url  = shlex.quote(url)
-    safe_dest = shlex.quote(f"mega:/Video/{filename}")
+    safe_dest = shlex.quote(get_dest(filename))
     referer   = get_referer(url)
 
     return (
@@ -73,7 +177,7 @@ def build_cmd(url, filename):
         f"-H 'Accept-Language: en-US,en;q=0.9' "
         f"-H 'Connection: keep-alive' "
         f"--progress-bar "
-        f"{safe_url} | rclone rcat {safe_dest}"
+        f"{safe_url} | rclone rcat --ignore-checksum --buffer-size 32M {safe_dest}"
     )
 
 
@@ -81,9 +185,23 @@ def run_job(job):
     job_id   = job["id"]
     url      = job["url"]
     filename = job["filename"]
+    dest     = get_dest(filename)
 
     set_job(job_id, status="running", log="", progress=0, retries=0, started_at=now())
-    append_log(job_id, f"[{now()}] Starting transfer: {filename}\n")
+    log(job_id, f"Starting transfer: {filename}")
+    log(job_id, f"Source URL: {url}")
+    log(job_id, f"Destination: {dest}")
+
+    referer     = get_referer(url)
+    source_size = get_source_size(url, referer, job_id)
+
+    # Warn if source size unknown
+    if source_size is None:
+        log(job_id, "⚠️  Proceeding without size validation")
+    elif source_size < MIN_VALID_SIZE:
+        log(job_id, f"❌ ABORT: Source file too small ({human_size(source_size)}) — likely an error page, not a real file!")
+        set_job(job_id, status="failed", finished_at=now())
+        return
 
     cmd = build_cmd(url, filename)
     env = os.environ.copy()
@@ -92,14 +210,15 @@ def run_job(job):
     retry_count = 0
 
     while True:
-        # Check if cancelled before each attempt
         with jobs_lock:
-            current_status = jobs.get(job_id, {}).get("status")
-        if current_status == "cancelled":
-            append_log(job_id, f"[{now()}] Transfer cancelled.\n")
-            return
+            if jobs.get(job_id, {}).get("status") == "cancelled":
+                log(job_id, "Transfer cancelled.")
+                # Clean up incomplete file
+                delete_remote_file(dest, job_id)
+                return
 
         try:
+            log(job_id, f"🚀 Attempt #{retry_count + 1} — starting curl | rclone pipe")
             p = subprocess.Popen(
                 cmd,
                 shell=True,
@@ -113,11 +232,11 @@ def run_job(job):
                 processes[job_id] = p
 
             for line in p.stdout:
-                # Check cancel mid-stream
                 with jobs_lock:
                     if jobs.get(job_id, {}).get("status") == "cancelled":
                         p.kill()
-                        append_log(job_id, f"[{now()}] Cancelled mid-transfer.\n")
+                        log(job_id, "Cancelled mid-transfer.")
+                        delete_remote_file(dest, job_id)
                         return
 
                 progress = parse_progress(line)
@@ -127,27 +246,68 @@ def run_job(job):
                 if not is_progress_line(line):
                     clean = line.strip()
                     if clean:
-                        append_log(job_id, f"[{now()}] {clean}\n")
+                        # Flag suspicious lines
+                        if any(w in clean.lower() for w in ['error', 'failed', 'fatal', 'denied', 'unauthorized', 'forbidden']):
+                            log(job_id, f"❌ {clean}")
+                        elif any(w in clean.lower() for w in ['notice', 'warn']):
+                            log(job_id, f"⚠️  {clean}")
+                        else:
+                            log(job_id, clean)
 
             p.wait()
 
             with processes_lock:
                 processes.pop(job_id, None)
 
+            log(job_id, f"curl|rclone exited with code {p.returncode}")
+
             if p.returncode == 0:
+                # ── Validate uploaded file size ──
+                log(job_id, "🔎 Validating uploaded file...")
+                uploaded_size = get_uploaded_size(dest, job_id)
+
+                if uploaded_size is None:
+                    log(job_id, "⚠️  Could not verify upload — marking done anyway")
+                    set_job(job_id, status="done", progress=100, finished_at=now())
+                    log(job_id, "✓ Transfer complete (unverified)")
+                    return
+
+                if uploaded_size < MIN_VALID_SIZE:
+                    log(job_id, f"❌ FAKE FILE DETECTED: uploaded only {human_size(uploaded_size)} — deleting and retrying!")
+                    delete_remote_file(dest, job_id)
+                    retry_count += 1
+                    set_job(job_id, retries=retry_count)
+                    time.sleep(10)
+                    continue
+
+                if source_size and uploaded_size < source_size * 0.95:
+                    log(job_id, f"❌ INCOMPLETE UPLOAD: got {human_size(uploaded_size)} of {human_size(source_size)} ({uploaded_size/source_size*100:.1f}%) — deleting and retrying!")
+                    delete_remote_file(dest, job_id)
+                    retry_count += 1
+                    set_job(job_id, retries=retry_count)
+                    time.sleep(10)
+                    continue
+
+                # Success!
                 set_job(job_id, status="done", progress=100, finished_at=now())
-                append_log(job_id, f"[{now()}] ✓ Transfer complete.\n")
+                if source_size:
+                    log(job_id, f"✓ Transfer complete! {human_size(uploaded_size)} / {human_size(source_size)} ({uploaded_size/source_size*100:.1f}%)")
+                else:
+                    log(job_id, f"✓ Transfer complete! {human_size(uploaded_size)}")
                 return
+
             else:
                 retry_count += 1
                 set_job(job_id, retries=retry_count)
-                append_log(job_id, f"[{now()}] ✗ Failed (exit {p.returncode}), retrying... (#{retry_count})\n")
+                log(job_id, f"❌ Failed (exit {p.returncode}) — retrying in 5s (#{retry_count})")
+                # Clean up partial file before retry
+                delete_remote_file(dest, job_id)
                 time.sleep(5)
 
         except Exception as e:
             retry_count += 1
             set_job(job_id, retries=retry_count)
-            append_log(job_id, f"[{now()}] Exception: {e}, retrying... (#{retry_count})\n")
+            log(job_id, f"❌ Exception: {e} — retrying in 5s (#{retry_count})")
             time.sleep(5)
 
 
@@ -165,7 +325,8 @@ def worker_loop():
             with jobs_lock:
                 if job_id in jobs:
                     jobs[job_id]["status"] = "failed"
-                    jobs[job_id]["log"] += f"[{now()}] Fatal: {e}\n"
+                    jobs[job_id]["log"] += f"[{now()}] ❌ Fatal: {e}\n"
+            print(f"[FATAL] Job {job_id[:8]}: {e}", flush=True)
         finally:
             job_queue.task_done()
 
